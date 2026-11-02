@@ -325,39 +325,293 @@ const ROLE_LABEL = {post:'Post', beam:'Beam / rail', joist:'Joist', shelf:'Shelf
 const HWCOL = {pin:0x9296a0, bracket:0x9aa0a8};   // hardware (fastener/bracket) colours
 
 /* ===== State (config) =====
-   P is the ENTIRE design: structure dims/flags + the wall sub-config (P.wall) +
-   shared lumber-size choices + which `mode` is active. It is the one object that
-   gets auto-saved to localStorage and captured wholesale by presets. The values
-   here are the defaults for a fresh visitor (overwritten by saved state below). */
-const P = {
-  L:48, W:24, H:34, oc:16,
-  f_top:true, f_rack:true, f_shelf:false, f_cant:false,
-  brace:'diagonal', joinery:'pin', base:'frame', nShelf:2, overhang:12,
-  mode:'wall',
-  wall:{ height:96, oc:16, size:'2x4', walls:[ {len:144, from:-1, openings:[{kind:'door',x:18,w:36,h:82,sill:0},{kind:'window',x:96,w:36,h:36,sill:30}]}, {len:96, from:0, at:'end', dir:'right', corner:'3stud', openings:[]} ] },
-  autoSize:true, postSize:'4x4', beamSize:'2x4', joistSize:'2x4', braceSize:'2x4',
-};
-// localStorage key. The EXPERIMENTAL fork namespaces its keys (timberframer.*)
-// so iterating here can't corrupt the stable app's saved designs. (Stable uses
-// the un-namespaced timberframer.* keys.)
-const LS='timberframer.v1';   // experimental fork: isolated from stable's saved state
-// Load saved state over the defaults (best-effort; ignore corrupt/blocked storage).
-try{ const s=JSON.parse(localStorage.getItem(LS)||'null'); if(s) Object.assign(P,s); }catch(e){}
-P.mode='wall';   // Structure & Shelving modes removed — this is a wall/roof framer now
-// --- migrations: bring older saved states up to the current schema ---
-if(!['pin','bracket','lap'].includes(P.joinery)) P.joinery='pin';   // migrate old screw/pocket/dowel
-/* migrate old turn-based wall CHAIN → branch tree (from/at/dir). Each wall i>0 used to
-   chain off wall i-1's end with i-1's `turn`; reproduce that exactly so saved designs &
-   presets keep the same geometry, but now each wall can be re-parented to branch. */
-(function migrateWalls(){ const ws=P.wall&&P.wall.walls; if(!Array.isArray(ws)) return;
-  if(!ws.some(w=>w.from===undefined)) return;
-  ws.forEach((w,i)=>{ if(w.from!==undefined) return;
-    if(i===0){ w.from=-1; w.at='end'; w.dir='straight'; }
-    else { const pt=ws[i-1].turn; w.from=i-1; w.at='end'; w.dir=(pt==='left'||pt==='right')?pt:'straight'; } });
-})();
-// roof add-on config (UI scaffold only — no framing generated yet)
-if(P.wall) P.wall.roof = Object.assign({enabled:false, type:'gable', pitch:6, overhang:12, rafterSize:'2x6', rafterOC:16, shedFlip:false, shedShape:'outline'}, P.wall.roof||{});
+   P is the single source of truth for the app. We validate and normalize it before
+   use so older saved states, partial configs, and malformed localStorage values
+   fail predictably instead of producing broken geometry.
+*/
+const STORAGE_KEY = 'timberframer.v1';
+const STATE_VERSION = 1;
 
+function deepClone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function deepMerge(target, source) {
+  const out = deepClone(target);
+  if (!source || typeof source !== 'object') return out;
+
+  Object.keys(source).forEach(key => {
+    const srcVal = source[key];
+    const tgtVal = out[key];
+
+    if (srcVal && typeof srcVal === 'object' && !Array.isArray(srcVal) &&
+        tgtVal && typeof tgtVal === 'object' && !Array.isArray(tgtVal)) {
+      out[key] = deepMerge(tgtVal, srcVal);
+    } else {
+      out[key] = deepClone(srcVal);
+    }
+  });
+
+  return out;
+}
+
+function clampNumber(value, fallback, min, max) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.min(max, Math.max(min, num));
+}
+
+function normalizeWallOpenings(openings) {
+  if (!Array.isArray(openings)) return [];
+  return openings
+    .map((o, index) => {
+      if (!o || typeof o !== 'object') return null;
+      const kind = o.kind === 'window' ? 'window' : 'door';
+      const x = clampNumber(o.x, 0, 9999, 0);
+      const w = clampNumber(o.w, 36, 240, 6);
+      const h = clampNumber(o.h, 24, 240, 6);
+      const sill = clampNumber(o.sill ?? 30, 0, 120, 0);
+      const bearing = o.bearing !== false;
+      const header = o.header || defHeaderSize(w);
+
+      return {
+        kind,
+        x,
+        w,
+        h,
+        sill,
+        header,
+        bearing
+      };
+    })
+    .filter(Boolean);
+}
+
+function normalizeWallTree(walls) {
+  if (!Array.isArray(walls) || !walls.length) {
+    return [
+      {
+        len: 144,
+        from: -1,
+        at: 'end',
+        dir: 'straight',
+        corner: '3stud',
+        openings: []
+      }
+    ];
+  }
+
+  return walls.map((w, i) => {
+    const wall = w && typeof w === 'object' ? w : {};
+    const len = clampNumber(wall.len, 96, 600, 12);
+
+    let from = Number(wall.from);
+    if (!Number.isFinite(from)) from = i === 0 ? -1 : 0;
+
+    const at = (wall.at === 'start' || wall.at === 'end' || wall.at === 'mid') ? wall.at : 'end';
+    const dir = (wall.dir === 'left' || wall.dir === 'right' || wall.dir === 'straight') ? wall.dir : 'straight';
+    const corner = cornerType(wall.corner || '3stud');
+
+    return {
+      len,
+      from: Number.isFinite(from) ? from : -1,
+      at,
+      dir,
+      corner,
+      openings: normalizeWallOpenings(wall.openings)
+    };
+  });
+}
+
+function normalizeRoof(roof) {
+  const fallback = {
+    enabled: false,
+    type: 'gable',
+    pitch: 6,
+    overhang: 12,
+    rafterSize: '2x6',
+    rafterOC: 16,
+    shedFlip: false,
+    shedShape: 'outline'
+  };
+
+  if (!roof || typeof roof !== 'object') return fallback;
+
+  return {
+    ...fallback,
+    ...roof,
+    enabled: !!roof.enabled,
+    type: roof.type === 'shed' ? 'shed' : 'gable',
+    pitch: clampNumber(roof.pitch, 6, 24, 0),
+    overhang: clampNumber(roof.overhang, 0, 36, 0),
+    rafterSize: (LUMBER[roof.rafterSize] ? roof.rafterSize : '2x6'),
+    rafterOC: clampNumber(roof.rafterOC, 8, 24, 8),
+    shedFlip: !!roof.shedFlip,
+    shedShape: roof.shedShape === 'bbox' ? 'bbox' : 'outline'
+  };
+}
+
+function normalizeState(rawState) {
+  const base = deepClone(DEFAULT_STATE);
+
+  const merged = deepMerge(base, rawState || {});
+  const wall = merged.wall && typeof merged.wall === 'object' ? merged.wall : {};
+  const walls = normalizeWallTree(wall.walls);
+
+  merged.version = STATE_VERSION;
+  merged.mode = 'wall';
+  merged.L = clampNumber(merged.L, 48, 120, 12);
+  merged.W = clampNumber(merged.W, 24, 120, 8);
+  merged.H = clampNumber(merged.H, 34, 120, 8);
+  merged.oc = clampNumber(merged.oc, 8, 24, 8);
+  merged.base = ['frame', 'pier'].includes(merged.base) ? merged.base : 'frame';
+  merged.joinery = ['pin', 'bracket', 'lap'].includes(merged.joinery) ? merged.joinery : 'pin';
+  merged.brace = ['diagonal', 'none'].includes(merged.brace) ? merged.brace : 'diagonal';
+
+  merged.wall = {
+    height: clampNumber(wall.height, 48, 240, 24),
+    oc: clampNumber(wall.oc, 8, 24, 8),
+    size: ['2x4', '2x6'].includes(wall.size) ? wall.size : '2x4',
+    walls,
+    roof: normalizeRoof(wall.roof)
+  };
+
+  merged.autoSize = !!merged.autoSize;
+  merged.postSize = (LUMBER[merged.postSize] ? merged.postSize : '4x4');
+  merged.beamSize = (LUMBER[merged.beamSize] ? merged.beamSize : '2x4');
+  merged.joistSize = (LUMBER[merged.joistSize] ? merged.joistSize : '2x4');
+  merged.braceSize = (LUMBER[merged.braceSize] ? merged.braceSize : '2x4');
+
+  return merged;
+}
+
+function persistState() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(P));
+  } catch (error) {
+    console.warn('Could not save state to localStorage:', error);
+  }
+}
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return deepClone(DEFAULT_STATE);
+
+    const parsed = JSON.parse(raw);
+    const state = normalizeState(parsed);
+
+    // If loaded data was missing/invalid, we still accept the sanitized default.
+    return state;
+  } catch (error) {
+    console.warn('Saved state was invalid; using defaults.', error);
+    return deepClone(DEFAULT_STATE);
+  }
+}
+
+const DEFAULT_STATE = {
+  L: 48,
+  W: 24,
+  H: 34,
+  oc: 16,
+  f_top: true,
+  f_rack: true,
+  f_shelf: false,
+  f_cant: false,
+  brace: 'diagonal',
+  joinery: 'pin',
+  base: 'frame',
+  nShelf: 2,
+  overhang: 12,
+  mode: 'wall',
+  wall: {
+    height: 96,
+    oc: 16,
+    size: '2x4',
+    walls: [
+      {
+        len: 144,
+        from: -1,
+        at: 'end',
+        dir: 'straight',
+        corner: '3stud',
+        openings: [
+          { kind: 'door', x: 18, w: 36, h: 82, sill: 0 },
+          { kind: 'window', x: 96, w: 36, h: 36, sill: 30 }
+        ]
+      },
+      {
+        len: 96,
+        from: 0,
+        at: 'end',
+        dir: 'right',
+        corner: '3stud',
+        openings: []
+      }
+    ],
+    roof: {
+      enabled: false,
+      type: 'gable',
+      pitch: 6,
+      overhang: 12,
+      rafterSize: '2x6',
+      rafterOC: 16,
+      shedFlip: false,
+      shedShape: 'outline'
+    }
+  },
+  autoSize: true,
+  postSize: '4x4',
+  beamSize: '2x4',
+  joistSize: '2x4',
+  braceSize: '2x4'
+};
+
+// NOTE: this is intentionally initialized AFTER DEFAULT_STATE. It is the single
+// "safe" app state object.
+const P = loadState();
+
+// Hard reset if the loaded schema is clearly old or unsupported.
+if (!P || !P.wall || !Array.isArray(P.wall.walls)) {
+  Object.assign(P, deepClone(DEFAULT_STATE));
+}
+
+// Keep the app in wall mode; the structure/shelving modes were removed.
+P.mode = 'wall';
+
+// Migrations: older saved states may still contain old chain-based wall data.
+// We normalize it into the current branching-tree schema.
+(function migrateLegacyWalls() {
+  const walls = P.wall && Array.isArray(P.wall.walls) ? P.wall.walls : [];
+  if (!walls.length) return;
+
+  // If any wall already uses the new `from`/`at`/`dir` fields, do not rewrite.
+  const needsMigration = walls.some(w => w && w.from === undefined && w.turn !== undefined);
+  if (!needsMigration) return;
+
+  walls.forEach((w, i) => {
+    if (!w || typeof w !== 'object') return;
+
+    if (w.from !== undefined) return;
+
+    if (i === 0) {
+      w.from = -1;
+      w.at = 'end';
+      w.dir = 'straight';
+    } else {
+      const prevTurn = walls[i - 1] && walls[i - 1].turn;
+      w.from = i - 1;
+      w.at = 'end';
+      w.dir = (prevTurn === 'left' || prevTurn === 'right') ? prevTurn : 'straight';
+    }
+
+    delete w.turn;
+  });
+})();
+
+if (P.wall) {
+  P.wall.roof = normalizeRoof(P.wall.roof);
+}
 /* ===== member list + geometry =====
    members[] is the single source of truth: every builder pushes member objects
    here, and BOTH the 3D scene and the cut list are derived from it. hardware[]
