@@ -501,7 +501,6 @@ function loadState() {
     const parsed = JSON.parse(raw);
     const state = normalizeState(parsed);
 
-    // If loaded data was missing/invalid, we still accept the sanitized default.
     return state;
   } catch (error) {
     console.warn('Saved state was invalid; using defaults.', error);
